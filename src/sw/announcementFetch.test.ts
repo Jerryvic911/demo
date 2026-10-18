@@ -28,16 +28,31 @@ function rpc(replies: Reply[]) {
   return { bodies, run };
 }
 
+// Real cursor shape: the RPC's end-of-data cursor for ledger N, e.g.
+// ledger 5256415 -> "0022576134814171135-4294967295" (seen on testnet).
+const tip = (ledger: number) =>
+  `${((BigInt(ledger) << 32n) | 0xffffffffn).toString().padStart(19, '0')}-4294967295`;
+
 const page = (ids: string[], cursor?: string, latestLedger = 500): Reply => ({
   json: { result: { events: ids.map((id) => ({ id })), cursor, latestLedger } },
 });
 const addresses = (r: { announcements: { stealthAddress: string }[] }) =>
   r.announcements.map((a) => a.stealthAddress);
 
+describe('tip cursor shape', () => {
+  it('matches the real testnet cursor', () => {
+    expect(tip(5256415)).toBe('0022576134814171135-4294967295');
+  });
+});
+
 describe('fetchAnnouncements pagination', () => {
-  it('follows the cursor across full pages and reads the last page', async () => {
+  it('follows the cursor across full pages and finishes at the tip', async () => {
     const full = Array.from({ length: 1000 }, (_, i) => `a${i}`);
-    const { bodies, run } = rpc([page(full, 'c1'), page(['b'], 'c2', 502), page([], 'c2', 503)]);
+    const { bodies, run } = rpc([
+      page(full, 'c1', 502),
+      page(['b'], tip(503), 503),
+      page([], tip(503), 503),
+    ]);
 
     const result = await run();
 
@@ -50,7 +65,11 @@ describe('fetchAnnouncements pagination', () => {
   });
 
   it('keeps reading after a SHORT page when the RPC returns a cursor', async () => {
-    const { bodies, run } = rpc([page(['a', 'b'], 'c1'), page(['c'], 'c2'), page([], 'c2', 600)]);
+    const { bodies, run } = rpc([
+      page(['a', 'b'], 'c1'),
+      page(['c'], tip(600), 600),
+      page([], tip(600), 600),
+    ]);
 
     const result = await run();
 
@@ -60,16 +79,33 @@ describe('fetchAnnouncements pagination', () => {
     expect(bodies[1].params?.pagination?.cursor).toBe('c1');
   });
 
+  it('finishes when an empty page echoes a cursor that has reached the latest ledger', async () => {
+    // What the real RPC does when nothing new has been written.
+    const { bodies, run } = rpc([page([], tip(700), 700), page([], tip(700), 700)]);
+
+    const result = await run();
+
+    expect(result).toEqual({ announcements: [], latestLedger: 700 });
+    expect(bodies).toHaveLength(2);
+  });
+
   it('stops when the cursor is absent', async () => {
     const { bodies, run } = rpc([page(['a'])]);
     expect(addresses(await run())).toEqual(['a']);
     expect(bodies).toHaveLength(1);
   });
 
-  it('stops when the cursor stops advancing', async () => {
-    const { bodies, run } = rpc([page(['a'], 'c1'), page(['b'], 'c1')]);
-    expect(addresses(await run())).toEqual(['a', 'b']);
-    expect(bodies).toHaveLength(2);
+  it('rejects a repeated cursor on a page that returned events', async () => {
+    await expect(rpc([page(['a'], 'c1'), page(['b'], 'c1')]).run()).rejects.toThrow(/repeated/);
+  });
+
+  it('rejects a repeated cursor it cannot prove is the tip', async () => {
+    await expect(rpc([page(['a'], 'c1'), page([], 'c1')]).run()).rejects.toThrow(/repeated/);
+  });
+
+  it('rejects an empty repeated cursor that is still behind the latest ledger', async () => {
+    const { run } = rpc([page([], tip(100), 500), page([], tip(100), 500)]);
+    await expect(run()).rejects.toThrow(/repeated/);
   });
 
   it('skips an undecodable event but keeps the rest of the page', async () => {

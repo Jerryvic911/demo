@@ -14,6 +14,17 @@ function validLedger(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined;
 }
 
+/**
+ * Ledger sequence encoded in a Soroban event cursor ("<19-digit TOID>-<event index>").
+ * The TOID's high 32 bits are the ledger. Undefined if the cursor has another shape.
+ */
+function cursorLedger(cursor: string): number | undefined {
+  const match = /^(\d{1,19})-\d+$/.exec(cursor);
+  if (!match) return undefined;
+  const ledger = BigInt(match[1]) >> 32n;
+  return ledger <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(ledger) : undefined;
+}
+
 async function callRpc(
   fetchFn: typeof fetch,
   rpcUrl: string,
@@ -85,8 +96,9 @@ export async function fetchAnnouncements(
     if (!Array.isArray(result.events)) {
       throw new Error('Stellar RPC result is missing an events array');
     }
+    const events: unknown[] = result.events;
 
-    for (const event of result.events) {
+    for (const event of events) {
       if (!isRecord(event)) continue;
       try {
         const announcement = parseAnnouncementEvent(event);
@@ -101,9 +113,25 @@ export async function fetchAnnouncements(
 
     const next =
       typeof result.cursor === 'string' && result.cursor.length > 0 ? result.cursor : undefined;
-    if (!next || next === cursor) {
+
+    const finish = async () => {
       if (latestLedger === 0) latestLedger = await latestLedgerFromRpc(rpcUrl, fetchFn);
       return { announcements, latestLedger };
+    };
+
+    // No continuation cursor: the RPC says there is nothing more.
+    if (!next) return finish();
+
+    if (next === cursor) {
+      // Sending a cursor and getting the same one back is only legitimate at the tip:
+      // an empty page whose cursor has already reached the latest ledger. Anything
+      // else is a stalled or malformed response; fail so the caller keeps its cursor.
+      if (latestLedger === 0) latestLedger = await latestLedgerFromRpc(rpcUrl, fetchFn);
+      const reached = cursorLedger(next);
+      if (events.length === 0 && reached !== undefined && reached >= latestLedger) return finish();
+      throw new Error(
+        'Stellar RPC repeated its continuation cursor before reaching the latest ledger; scan stopped without advancing the cursor',
+      );
     }
     cursor = next;
   }
