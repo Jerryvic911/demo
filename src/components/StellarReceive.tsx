@@ -1314,6 +1314,19 @@ export function StellarReceive() {
     void scanPayments(retentionGap.oldestAvailableLedger);
   }, [address, retentionGap, scanPayments]);
 
+  // (Re)seal the background-scan key whenever it can be used: notifications on,
+  // worker ready, keys unlocked. Lock (disconnect / app idle lock) removes the
+  // wrapping key; this puts a fresh one back once the keys exist again.
+  const registerScanKey = notifications.registerViewingKey;
+  const scanNotificationsEnabled = notifications.state.enabled;
+  const scanWorkerReady = notifications.state.swRegistered;
+  useEffect(() => {
+    if (!address || !stellarKeys || !scanNotificationsEnabled || !scanWorkerReady) return;
+    registerScanKey(address, stellarKeys).catch((error: unknown) => {
+      console.error('Failed to register viewing key:', error);
+    });
+  }, [address, stellarKeys, scanNotificationsEnabled, scanWorkerReady, registerScanKey]);
+
   const handleToggleNotifications = useCallback(async () => {
     if (notifications.state.enabled) {
       await notifications.disableNotifications();
@@ -1321,12 +1334,9 @@ export function StellarReceive() {
         await notifications.unregisterViewingKey(address);
       }
     } else {
-      await notifications.enableNotifications();
-      if (address && stellarKeys) {
-        await notifications.registerViewingKey(address, stellarKeys);
-      }
+      await notifications.enableNotifications(); // the effect above seals the key
     }
-  }, [notifications, address, stellarKeys]);
+  }, [notifications, address]);
 
   const handleFireTestNotification = useCallback(async () => {
     try {
