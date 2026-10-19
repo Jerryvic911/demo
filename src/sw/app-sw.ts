@@ -9,11 +9,6 @@ import { CacheableResponsePlugin } from 'workbox-cacheable-response';
 import { CACHE_PREFIX, CACHE_VERSION_SUFFIX, cacheName, purgeObsoleteCaches } from '../lib/swCache';
 import { fetchEventPages } from '../lib/stellar/rpcEvents';
 import { retentionGapFromError, type RetentionGap } from '../lib/stellar/scannerCursor';
-import { decodeAnnouncementEvents } from '../lib/stellar/announcementEvent';
-import { scanPages, deliverMatch, type MatchNotifier } from './backgroundScan';
-import { createIdbScanKeyBackend } from './idbScanKeyBackend';
-import { findSpendingSecretField, removeScanKey } from './scanKeyStore';
-import { scrubLegacySpendingMaterial, upsertAccountRecord } from './accountRecords';
 import {
   deliverPushNotification,
   type NotificationPresentation,
@@ -117,6 +112,9 @@ const QUEUE_SYNC_TAG = 'wraith-offline-queue';
 
 interface StoredViewingKey {
   publicKey: string;
+  encryptedViewingKey: string;
+  encryptedSpendingPubKey: string;
+  encryptedSpendingScalar: string;
   lastScannedLedger?: number;
   timestamp: number;
   relayUrl?: string;
@@ -207,57 +205,25 @@ async function notifyRetentionGap(publicKey: string, gap: RetentionGap): Promise
   }
 }
 
-const matchNotifier: MatchNotifier = {
-  showNotification: (title, options) => self.registration.showNotification(title, options),
-  broadcast: async (message) => {
-    const clients = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
-    for (const client of clients) client.postMessage(message);
-  },
-};
-
-/**
- * Scans from the stored cursor through the shared lossless pager. The sealed scan key is
- * opened first, so a locked or unregistered account costs no network. Each page is matched
- * and notified BEFORE its cursor is persisted, and a lock between pages stops the scan
- * without committing the unread page.
- */
 async function scanStoredKey(
   db: IDBDatabase,
   storedKey: StoredViewingKey,
   startLedger: number | undefined,
 ): Promise<void> {
-  await scanPages({
-    backend: createIdbScanKeyBackend(),
-    publicKey: storedKey.publicKey,
-    notifyMatch: (match) => deliverMatch(matchNotifier, match),
-    readPages: (onPage) =>
-      fetchEventPages({
-        rpcUrl: STELLAR_RPC_URL,
-        contractId: ANNOUNCER_CONTRACT,
-        // undefined lets the module clamp a first scan to the retention window.
-        startLedger,
-        onPage: (page) =>
-          onPage({
-            announcements: decodeAnnouncementEvents(page.events),
-            committedLedger: page.committedLedger,
-          }),
-      }),
-    commit: (nextLedger) => updateLastScannedLedger(db, storedKey.publicKey, nextLedger),
+  const { events } = await fetchEventPages({
+    rpcUrl: STELLAR_RPC_URL,
+    contractId: ANNOUNCER_CONTRACT,
+    // `undefined` lets the module clamp a first scan to the retention window
+    // instead of asking for a ledger the RPC has already dropped.
+    startLedger,
+    onPage: async (page) => {
+      await updateLastScannedLedger(db, storedKey.publicKey, page.committedLedger + 1);
+    },
   });
-}
 
-async function scrubLegacyKeys(): Promise<void> {
-  try {
-    const db = await openDB();
-    try {
-      const scrubbed = await scrubLegacySpendingMaterial(db, STORE_NAME);
-      if (scrubbed > 0)
-        console.log('[app-sw] Removed legacy key fields from ' + scrubbed + ' record(s)');
-    } finally {
-      db.close();
-    }
-  } catch (error) {
-    console.error('[app-sw] Legacy key scrub failed:', error);
+  if (events.length > 0) {
+    console.log(`[app-sw] Found ${events.length} events for ${storedKey.publicKey}`);
+    // TODO: decrypt and scan with Wraith SDK when bundled in SW context
   }
 }
 
@@ -321,7 +287,6 @@ self.addEventListener('activate', (event) => {
   event.waitUntil(
     Promise.all([
       self.clients.claim(),
-      scrubLegacyKeys(),
       // Drop every cache this app owns that is not part of the running version:
       // superseded versions, newer versions left behind by a roll-back, and
       // caches written by installs that predate explicit versioning.
@@ -379,8 +344,6 @@ self.addEventListener('notificationclick', (event) => {
 // ── Message handler ────────────────────────────────────────────────────────────
 
 self.addEventListener('message', (event) => {
-  const { type, publicKey } = event.data;
-
   const forbidden = findSpendingSecretField(event.data);
   if (forbidden) {
     console.error('[app-sw] Dropped message: "' + forbidden + '" must never reach the worker');
@@ -390,9 +353,6 @@ self.addEventListener('message', (event) => {
     });
     return;
   }
-
-  if (type === 'SKIP_WAITING') {
-    self.skipWaiting();
   const validation = validateMainThreadMessage(event.data);
   if (!validation.valid) {
     console.warn('[app-sw] Ignoring invalid message from main thread:', validation.reason);
@@ -401,30 +361,6 @@ self.addEventListener('message', (event) => {
 
   const msg = validation.data;
 
-  if (type === 'REGISTER_VIEWING_KEY') {
-    event.waitUntil(
-      (async () => {
-        try {
-          if (typeof publicKey !== 'string' || publicKey.length === 0) {
-            throw new Error('Missing publicKey');
-          }
-          const db = await openDB();
-          try {
-            await upsertAccountRecord(db, STORE_NAME, publicKey);
-          } finally {
-            db.close();
-          }
-          (event.source as Client)?.postMessage({ type: 'VIEWING_KEY_REGISTERED' });
-        } catch (error) {
-          console.error('[app-sw] Failed to register viewing key:', error);
-          (event.source as Client)?.postMessage({
-            type: 'VIEWING_KEY_ERROR',
-            error: error instanceof Error ? error.message : 'Unknown error',
-          });
-        }
-      })(),
-    );
-  }
   switch (msg.type) {
     case 'SKIP_WAITING':
       self.skipWaiting();
@@ -434,32 +370,6 @@ self.addEventListener('message', (event) => {
       event.waitUntil(
         (async () => {
           const db = await openDB();
-          const transaction = db.transaction([STORE_NAME], 'readwrite');
-          const store = transaction.objectStore(STORE_NAME);
-          await new Promise<void>((resolve, reject) => {
-            const request = store.delete(publicKey);
-            request.onerror = () => reject(request.error);
-            request.onsuccess = () => resolve();
-          });
-
-          await removeScanKey(createIdbScanKeyBackend(), publicKey);
-
-          // Unregister periodic sync if no keys remain
-          const allKeys = await new Promise<StoredViewingKey[]>((resolve, reject) => {
-            const tx = db.transaction([STORE_NAME], 'readonly');
-            const st = tx.objectStore(STORE_NAME);
-            const req = st.getAll();
-            req.onerror = () => reject(req.error);
-            req.onsuccess = () => resolve(req.result || []);
-          });
-          db.close();
-
-          if (allKeys.length === 0 && 'periodicSync' in self.registration) {
-            await (
-              self.registration as ServiceWorkerRegistration & {
-                periodicSync: { unregister(tag: string): Promise<void> };
-              }
-            ).periodicSync.unregister(SYNC_TAG);
           try {
             const storedKey = await new Promise<StoredViewingKey | undefined>((resolve, reject) => {
               const request = db
@@ -539,54 +449,6 @@ self.addEventListener('message', (event) => {
               request.onsuccess = () => resolve();
             });
 
-          // Store subscription info in IndexedDB
-          const db = await openDB();
-          const transaction = db.transaction([STORE_NAME], 'readwrite');
-          const store = transaction.objectStore(STORE_NAME);
-
-          // Update existing entry or create new one
-          const existing = await new Promise<StoredViewingKey | undefined>((resolve, reject) => {
-            const request = store.get(subscription.keys?.p256dh || 'default');
-            request.onerror = () => reject(request.error);
-            request.onsuccess = () => resolve(request.result);
-          });
-
-          const entry: StoredViewingKey = existing || {
-            publicKey: subscription.keys?.p256dh || 'default',
-            timestamp: Date.now(),
-          };
-
-          // Store relay URL and meta-address hash
-          (entry as any).relayUrl = relayUrl;
-          (entry as any).metaAddressHash = metaAddressHash;
-          (entry as any).pushSubscription = subscription;
-
-          await new Promise<void>((resolve, reject) => {
-            const request = store.put(entry);
-            request.onerror = () => reject(request.error);
-            request.onsuccess = () => resolve();
-          });
-
-          db.close();
-          (event.source as Client)?.postMessage({ type: 'PUSH_SUBSCRIPTION_REGISTERED' });
-        } catch (error) {
-          console.error('[app-sw] Failed to register push subscription:', error);
-          (event.source as Client)?.postMessage({
-            type: 'PUSH_SUBSCRIPTION_ERROR',
-            error: error instanceof Error ? error.message : 'Unknown error',
-          });
-        }
-      })(),
-    );
-  }
-
-  if (type === 'UNREGISTER_PUSH_SUBSCRIPTION') {
-    event.waitUntil(
-      (async () => {
-        try {
-          const { subscription, metaAddressHash } = event.data ?? {};
-          if (!subscription) {
-            throw new Error('Missing subscription');
             // Unregister periodic sync if no keys remain
             const allKeys = await new Promise<StoredViewingKey[]>((resolve, reject) => {
               const tx = db.transaction([STORE_NAME], 'readonly');
@@ -768,3 +630,6 @@ self.addEventListener('push', (event: PushEvent) => {
 });
 
 export {};
+function findSpendingSecretField(data: any) {
+  throw new Error('Function not implemented.');
+}
