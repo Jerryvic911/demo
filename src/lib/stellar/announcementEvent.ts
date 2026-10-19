@@ -51,3 +51,17 @@ function parseV2(event: Record<string, unknown>, topics: string[]): Announcement
 
   return { schemeId, stealthAddress, caller, ephemeralPubKey, metadata };
 }
+
+/** Decodes one page of RPC events, skipping entries that are not (or cannot be decoded as) announcements. */
+export function decodeAnnouncementEvents(events: readonly object[]): Announcement[] {
+  const announcements: Announcement[] = [];
+  for (const event of events) {
+    try {
+      const announcement = parseAnnouncementEvent(event as Record<string, unknown>);
+      if (announcement) announcements.push(announcement);
+    } catch {
+      // An undecodable event must not abort the page: the cursor still has to cover its neighbours.
+    }
+  }
+  return announcements;
+}

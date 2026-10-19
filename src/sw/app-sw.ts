@@ -7,17 +7,18 @@ import { NetworkFirst, CacheFirst } from 'workbox-strategies';
 import { ExpirationPlugin } from 'workbox-expiration';
 import { CacheableResponsePlugin } from 'workbox-cacheable-response';
 import { CACHE_PREFIX, CACHE_VERSION_SUFFIX, cacheName, purgeObsoleteCaches } from '../lib/swCache';
+import { fetchEventPages } from '../lib/stellar/rpcEvents';
 import { retentionGapFromError, type RetentionGap } from '../lib/stellar/scannerCursor';
+import { decodeAnnouncementEvents } from '../lib/stellar/announcementEvent';
+import { scanPages, deliverMatch, type MatchNotifier } from './backgroundScan';
+import { createIdbScanKeyBackend } from './idbScanKeyBackend';
+import { findSpendingSecretField, removeScanKey } from './scanKeyStore';
+import { scrubLegacySpendingMaterial, upsertAccountRecord } from './accountRecords';
 import {
   deliverPushNotification,
   type NotificationPresentation,
   type ValidatedPushPayload,
 } from './notificationPayload';
-import { scanWithStoredKey, deliverMatch, type MatchNotifier } from './backgroundScan';
-import { fetchAnnouncements } from './announcementFetch';
-import { createIdbScanKeyBackend } from './idbScanKeyBackend';
-import { findSpendingSecretField, removeScanKey } from './scanKeyStore';
-import { scrubLegacySpendingMaterial, upsertAccountRecord } from './accountRecords';
 import {
   claimNotificationId,
   createNotificationStore,
@@ -177,6 +178,20 @@ async function updateLastScannedLedger(
 }
 
 // ── Stellar RPC helpers ────────────────────────────────────────────────────────
+//
+// Event reads go through the shared, paginated implementation in
+// src/lib/stellar/rpcEvents.ts. It follows the RPC cursor to the end of the
+// committed boundary, maps out-of-range requests to retention gaps, and reports
+// progress per page so a sync that is killed mid-way restarts at the first
+// ledger proven fully announced instead of at the tip. A page boundary can
+// split one ledger, so the boundary ledger is re-read rather than skipped.
+
+async function notifyRetentionGap(publicKey: string, gap: RetentionGap): Promise<void> {
+  const clients = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+  for (const client of clients) {
+    client.postMessage({ type: 'STELLAR_SCAN_RETENTION_GAP', publicKey, ...gap });
+  }
+}
 
 const matchNotifier: MatchNotifier = {
   showNotification: (title, options) => self.registration.showNotification(title, options),
@@ -186,20 +201,35 @@ const matchNotifier: MatchNotifier = {
   },
 };
 
+/**
+ * Scans from the stored cursor through the shared lossless pager. The sealed scan key is
+ * opened first, so a locked or unregistered account costs no network. Each page is matched
+ * and notified BEFORE its cursor is persisted, and a lock between pages stops the scan
+ * without committing the unread page.
+ */
 async function scanStoredKey(
   db: IDBDatabase,
   storedKey: StoredViewingKey,
-  startLedger: number,
+  startLedger: number | undefined,
 ): Promise<void> {
-  const result = await scanWithStoredKey({
+  await scanPages({
     backend: createIdbScanKeyBackend(),
     publicKey: storedKey.publicKey,
-    loadAnnouncements: () => fetchAnnouncements(STELLAR_RPC_URL, ANNOUNCER_CONTRACT, startLedger),
     notifyMatch: (match) => deliverMatch(matchNotifier, match),
+    readPages: (onPage) =>
+      fetchEventPages({
+        rpcUrl: STELLAR_RPC_URL,
+        contractId: ANNOUNCER_CONTRACT,
+        // undefined lets the module clamp a first scan to the retention window.
+        startLedger,
+        onPage: (page) =>
+          onPage({
+            announcements: decodeAnnouncementEvents(page.events),
+            committedLedger: page.committedLedger,
+          }),
+      }),
+    commit: (nextLedger) => updateLastScannedLedger(db, storedKey.publicKey, nextLedger),
   });
-  // Locked / not registered: keep the cursor so nothing is skipped after unlock.
-  if (result.status !== 'scanned') return;
-  await updateLastScannedLedger(db, storedKey.publicKey, result.nextLedger);
 }
 
 async function scrubLegacyKeys(): Promise<void> {
@@ -208,18 +238,12 @@ async function scrubLegacyKeys(): Promise<void> {
     try {
       const scrubbed = await scrubLegacySpendingMaterial(db, STORE_NAME);
       if (scrubbed > 0)
-        console.log(`[app-sw] Removed legacy key fields from ${scrubbed} record(s)`);
+        console.log('[app-sw] Removed legacy key fields from ' + scrubbed + ' record(s)');
     } finally {
       db.close();
     }
   } catch (error) {
     console.error('[app-sw] Legacy key scrub failed:', error);
-  }
-}
-async function notifyRetentionGap(publicKey: string, gap: RetentionGap): Promise<void> {
-  const clients = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
-  for (const client of clients) {
-    client.postMessage({ type: 'STELLAR_SCAN_RETENTION_GAP', publicKey, ...gap });
   }
 }
 
@@ -237,17 +261,14 @@ async function handleSync(): Promise<void> {
     });
 
     for (const storedKey of allKeys) {
-      const startLedger = storedKey.lastScannedLedger || 1;
       try {
-        await scanStoredKey(db, storedKey, startLedger);
+        await scanStoredKey(db, storedKey, storedKey.lastScannedLedger);
       } catch (error) {
         const gap = retentionGapFromError(error);
         if (!gap) throw error;
-        if (storedKey.lastScannedLedger === undefined) {
-          await scanStoredKey(db, storedKey, gap.oldestAvailableLedger);
-        } else {
-          await notifyRetentionGap(storedKey.publicKey, gap);
-        }
+        // A stored cursor that fell out of the window is never advanced
+        // silently: surface the gap so the page can offer a recovery scan.
+        await notifyRetentionGap(storedKey.publicKey, gap);
       }
     }
 
@@ -348,7 +369,7 @@ self.addEventListener('message', (event) => {
 
   const forbidden = findSpendingSecretField(event.data);
   if (forbidden) {
-    console.error(`[app-sw] Dropped message: "${forbidden}" must never reach the worker`);
+    console.error('[app-sw] Dropped message: "' + forbidden + '" must never reach the worker');
     (event.source as Client)?.postMessage({
       type: 'VIEWING_KEY_ERROR',
       error: 'Spending secrets are not accepted by the service worker',
@@ -436,7 +457,9 @@ self.addEventListener('message', (event) => {
             request.onerror = () => reject(request.error);
             request.onsuccess = () => resolve();
           });
+
           await removeScanKey(createIdbScanKeyBackend(), publicKey);
+
           // Unregister periodic sync if no keys remain
           const allKeys = await new Promise<StoredViewingKey[]>((resolve, reject) => {
             const tx = db.transaction([STORE_NAME], 'readonly');

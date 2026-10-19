@@ -4,12 +4,10 @@ import { describe, expect, it } from 'vitest';
 
 const WORKER_FACING_FILES = [
   'src/sw/app-sw.ts',
-  'src/sw/stellar-notification-sw.ts',
   'src/hooks/useStellarNotifications.ts',
   'src/sw/backgroundScan.ts',
   'src/sw/scanKeyStore.ts',
   'src/sw/idbScanKeyBackend.ts',
-  'src/sw/announcementFetch.ts',
   'src/workers/stellarScanMatch.ts',
 ];
 

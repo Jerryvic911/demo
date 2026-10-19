@@ -2,7 +2,7 @@
 import { act, render } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ScanKeyBackend } from '@/sw/scanKeyStore';
-import { scanWithStoredKey } from '@/sw/backgroundScan';
+import { scanPages } from '@/sw/backgroundScan';
 import { MemoryScanKeyBackend } from '@/sw/testing/memoryScanKeyBackend';
 
 const holder = vi.hoisted(() => ({ backend: undefined as ScanKeyBackend | undefined }));
@@ -77,15 +77,18 @@ describe('scan-key lock lifecycle', () => {
     await vi.waitFor(async () => expect(await unlocked()).toBe(false));
     expect(await backend.getRecord(ACCOUNT)).toBeDefined(); // blob stays, but it is inert
 
-    const loadAnnouncements = vi.fn(async () => ({ announcements: [], latestLedger: 1 }));
-    const result = await scanWithStoredKey({
+    const readPages = vi.fn(async () => {});
+    const commit = vi.fn(async () => {});
+    const result = await scanPages({
       backend,
       publicKey: ACCOUNT,
-      loadAnnouncements,
+      readPages,
+      commit,
       notifyMatch: vi.fn(async () => {}),
     });
     expect(result).toEqual({ status: 'locked' });
-    expect(loadAnnouncements).not.toHaveBeenCalled();
+    expect(readPages).not.toHaveBeenCalled();
+    expect(commit).not.toHaveBeenCalled();
   });
 
   it('the app idle re-lock (clearStellar) locks the scan key', async () => {

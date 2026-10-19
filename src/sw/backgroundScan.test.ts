@@ -6,15 +6,20 @@ import {
   SCHEME_ID,
 } from '@wraith-protocol/sdk/chains/stellar';
 import type { Announcement } from '@wraith-protocol/sdk/chains/stellar';
-import { buildMatchNotification, scanWithStoredKey, type BackgroundMatch } from './backgroundScan';
+import {
+  buildMatchNotification,
+  scanPages,
+  type BackgroundMatch,
+  type ScanPage,
+} from './backgroundScan';
 import {
   lockAllScanKeys,
   lockScanKey,
   removeScanKey,
   sealScanKey,
   toScanKeyMaterial,
+  type ScanKeyBackend,
 } from './scanKeyStore';
-import type { ScanKeyBackend } from './scanKeyStore';
 import { MemoryScanKeyBackend } from './testing/memoryScanKeyBackend';
 
 const ACCOUNT = 'GTESTACCOUNT';
@@ -40,19 +45,31 @@ function setup() {
   const recipient = deriveStealthKeys(randomSignature());
   const stranger = deriveStealthKeys(randomSignature());
   const mine = makeAnnouncement(recipient.spendingPubKey, recipient.viewingPubKey);
+  const mine2 = makeAnnouncement(recipient.spendingPubKey, recipient.viewingPubKey);
   const noise = makeAnnouncement(stranger.spendingPubKey, stranger.viewingPubKey);
   const notified: BackgroundMatch[] = [];
-  const loadAnnouncements = vi.fn(async () => ({
-    announcements: [noise, mine],
-    latestLedger: 100,
-  }));
-  const scan = (backend: ScanKeyBackend, publicKey = ACCOUNT) =>
-    scanWithStoredKey({
+  const commits: number[] = [];
+  const pages: ScanPage[] = [
+    { announcements: [noise, mine], committedLedger: 100 },
+    { announcements: [mine2], committedLedger: 200 },
+  ];
+  const readPages = vi.fn(async (onPage: (page: ScanPage) => Promise<void>) => {
+    for (const page of pages) await onPage(page);
+  });
+  const run = (
+    backend: ScanKeyBackend,
+    opts: { publicKey?: string; onCommit?: () => Promise<void> } = {},
+  ) =>
+    scanPages({
       backend,
-      publicKey,
-      loadAnnouncements,
+      publicKey: opts.publicKey ?? ACCOUNT,
       notifyMatch: async (m) => {
         notified.push(m);
+      },
+      readPages,
+      commit: async (next) => {
+        commits.push(next);
+        await opts.onCommit?.();
       },
     });
   const registered = async () => {
@@ -60,98 +77,96 @@ function setup() {
     await sealScanKey(backend, ACCOUNT, toScanKeyMaterial(recipient));
     return backend;
   };
-  return { recipient, mine, notified, loadAnnouncements, scan, registered };
+  const addresses = () => notified.map((m) => m.stealthAddress);
+  return { recipient, mine, mine2, notified, commits, readPages, run, registered, addresses };
 }
 
-describe('background scanning', () => {
-  it('notifies only for matching announcements and leaks no secrets', async () => {
-    const { recipient, mine, notified, scan, registered } = setup();
+describe('background page scanning', () => {
+  it('notifies matches page by page, commits each page after it, and leaks no secrets', async () => {
+    const { recipient, mine, mine2, commits, notified, run, registered, addresses } = setup();
     const backend = await registered();
 
-    const result = await scan(backend);
+    expect(await run(backend)).toEqual({ status: 'scanned' });
 
-    expect(result).toMatchObject({ status: 'scanned', nextLedger: 101 });
-    expect(notified).toEqual([{ publicKey: ACCOUNT, stealthAddress: mine.stealthAddress }]);
+    expect(addresses()).toEqual([mine.stealthAddress, mine2.stealthAddress]);
+    expect(commits).toEqual([101, 201]);
 
-    const wire = JSON.stringify([result, notified, buildMatchNotification(notified[0])]);
+    const wire = JSON.stringify([notified, commits, buildMatchNotification(notified[0])]);
     expect(wire).not.toContain(recipient.spendingScalar.toString(16));
     expect(wire).not.toContain(recipient.spendingScalar.toString());
     expect(wire).not.toContain(bytesToHex(recipient.viewingKey));
     expect(backend.dump()).not.toContain(recipient.spendingScalar.toString());
   });
 
-  it('lock: does not decrypt, fetch or notify; unlocking resumes scanning', async () => {
-    const { recipient, notified, loadAnnouncements, scan, registered } = await (async () => {
-      const s = setup();
-      return { ...s, registered: s.registered };
-    })();
+  it('lock: reads nothing, commits nothing and notifies nothing; unlocking resumes', async () => {
+    const { recipient, notified, commits, readPages, run, registered } = setup();
     const backend = await registered();
 
     await lockScanKey(backend, ACCOUNT);
-    expect(await scan(backend)).toEqual({ status: 'locked' });
-    expect(loadAnnouncements).not.toHaveBeenCalled();
+    expect(await run(backend)).toEqual({ status: 'locked' });
+    expect(readPages).not.toHaveBeenCalled();
+    expect(commits).toEqual([]);
     expect(notified).toHaveLength(0);
 
     await sealScanKey(backend, ACCOUNT, toScanKeyMaterial(recipient)); // unlock
-    expect((await scan(backend)).status).toBe('scanned');
-    expect(notified).toHaveLength(1);
+    expect((await run(backend)).status).toBe('scanned');
+    expect(commits).toEqual([101, 201]);
   });
 
   it('lock-all locks every account', async () => {
-    const { scan, registered } = setup();
+    const { run, registered } = setup();
     const backend = await registered();
     await lockAllScanKeys(backend);
-    expect((await scan(backend)).status).toBe('locked');
+    expect((await run(backend)).status).toBe('locked');
   });
 
-  it('lock during a scan suppresses the notification', async () => {
-    const { mine, notified, loadAnnouncements, scan, registered } = setup();
+  it('a lock between pages stops the scan without committing the unread page', async () => {
+    const { commits, run, registered, addresses, mine } = setup();
     const backend = await registered();
-    loadAnnouncements.mockImplementationOnce(async () => {
-      await lockScanKey(backend, ACCOUNT);
-      return { announcements: [mine], latestLedger: 100 };
-    });
 
-    expect(await scan(backend)).toEqual({ status: 'locked' });
-    expect(notified).toHaveLength(0);
+    const result = await run(backend, { onCommit: () => lockScanKey(backend, ACCOUNT) });
+
+    expect(result).toEqual({ status: 'locked' });
+    expect(addresses()).toEqual([mine.stealthAddress]); // page 2 was never matched
+    expect(commits).toEqual([101]); // the cursor stops before page 2, so it is re-read later
   });
 
   it('restart: a fresh worker resumes from persisted state alone', async () => {
-    const { notified, scan, registered } = setup();
+    const { run, registered, commits } = setup();
     const backend = await registered();
 
-    const afterRestart = backend.restart();
-    expect((await scan(afterRestart)).status).toBe('scanned');
-    expect(notified).toHaveLength(1);
+    expect((await run(backend.restart())).status).toBe('scanned');
+    expect(commits).toEqual([101, 201]);
   });
 
   it('restart: a locked key stays locked', async () => {
-    const { scan, registered } = setup();
+    const { run, registered } = setup();
     const backend = await registered();
     await lockScanKey(backend, ACCOUNT);
 
-    expect((await scan(backend.restart())).status).toBe('locked');
+    expect((await run(backend.restart())).status).toBe('locked');
   });
 
   it('key removal wipes everything and the worker goes idle', async () => {
-    const { notified, loadAnnouncements, scan, registered } = setup();
+    const { readPages, notified, commits, run, registered } = setup();
     const backend = await registered();
 
     await removeScanKey(backend, ACCOUNT);
 
     expect(backend.records.size).toBe(0);
     expect(backend.keys.size).toBe(0);
-    expect(await scan(backend.restart())).toEqual({ status: 'missing' });
-    expect(loadAnnouncements).not.toHaveBeenCalled();
+    expect(await run(backend.restart())).toEqual({ status: 'missing' });
+    expect(readPages).not.toHaveBeenCalled();
     expect(notified).toHaveLength(0);
+    expect(commits).toEqual([]);
   });
 
   it('a sealed blob cannot be reused for another account', async () => {
-    const { scan, registered } = setup();
+    const { run, registered } = setup();
     const backend = await registered();
     backend.records.set('GOTHER', { ...backend.records.get(ACCOUNT)!, publicKey: 'GOTHER' });
     backend.keys.set('GOTHER', backend.keys.get(ACCOUNT)!);
 
-    expect((await scan(backend, 'GOTHER')).status).toBe('invalid');
+    expect((await run(backend, { publicKey: 'GOTHER' })).status).toBe('invalid');
   });
 });

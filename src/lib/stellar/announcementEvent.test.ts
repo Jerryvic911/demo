@@ -5,7 +5,7 @@ import {
   deriveStealthKeys,
   generateStealthAddress,
 } from '@wraith-protocol/sdk/chains/stellar';
-import { parseAnnouncementEvent } from './announcementEvent';
+import { parseAnnouncementEvent, decodeAnnouncementEvents } from './announcementEvent';
 
 const sym = (s: string) => xdr.ScVal.scvSymbol(s);
 const u32 = (n: number) => xdr.ScVal.scvU32(n);
@@ -73,5 +73,22 @@ describe('parseAnnouncementEvent', () => {
     expect(parseAnnouncementEvent({ topic: 'nope', value })).toBeNull();
     const shortValue = b64(xdr.ScVal.scvVec([addr(f.stealth), bytes(f.eph)]));
     expect(parseAnnouncementEvent({ topic: topics, value: shortValue })).toBeNull();
+  });
+});
+
+describe('decodeAnnouncementEvents', () => {
+  it('decodes valid v1 and v2 events and skips junk', () => {
+    const f = fixture();
+    const v1 = {
+      topic: [b64(sym('announce')), b64(u32(1)), b64(addr(f.stealth))],
+      value: b64(xdr.ScVal.scvVec([addr(f.caller), bytes(f.eph), bytes(f.meta)])),
+    };
+    const v2 = {
+      contractId: 'CANNOUNCER',
+      topic: [b64(sym('announce')), b64(u32(2)), b64(u32(7)), b64(u32(0))],
+      value: b64(xdr.ScVal.scvVec([addr(f.stealth), bytes(f.eph), bytes(f.meta)])),
+    };
+    const result = decodeAnnouncementEvents([v1, { topic: ['bad'], value: 'bad' }, v2, {}]);
+    expect(result.map((a) => a.schemeId)).toEqual([1, 2]);
   });
 });
