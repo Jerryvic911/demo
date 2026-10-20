@@ -8,6 +8,7 @@ import { ExpirationPlugin } from 'workbox-expiration';
 import { CacheableResponsePlugin } from 'workbox-cacheable-response';
 import { CACHE_PREFIX, CACHE_VERSION_SUFFIX, cacheName, purgeObsoleteCaches } from '../lib/swCache';
 import { fetchEventPages } from '../lib/stellar/rpcEvents';
+import { getStellarContractId, getStellarNetworkConfig } from '../lib/stellar/deployments';
 import { retentionGapFromError, type RetentionGap } from '../lib/stellar/scannerCursor';
 import { decodeAnnouncementEvents } from '../lib/stellar/announcementEvent';
 import { scanPages, deliverMatch, type MatchNotifier } from './backgroundScan';
@@ -94,8 +95,6 @@ registerRoute(
 // ─── Stellar Notification Service Worker logic ────────────────────────────────
 // (merged from src/sw/stellar-notification-sw.ts)
 
-const ANNOUNCER_CONTRACT = 'CCJLJ2QRBJAAKIG6ELNQVXLLWMKKWVN5O2FKWUETHZGMPAD4MHK7WVWL';
-const STELLAR_RPC_URL = 'https://soroban-testnet.stellar.org';
 const DB_NAME = 'wraith-stellar-notifications';
 const DB_VERSION = 2;
 const STORE_NAME = 'viewing-keys';
@@ -212,14 +211,15 @@ async function scanStoredKey(
   storedKey: StoredViewingKey,
   startLedger: number | undefined,
 ): Promise<void> {
-  await scanPages({
+
+    await scanPages({
     backend: createIdbScanKeyBackend(),
     publicKey: storedKey.publicKey,
     notifyMatch: (match) => deliverMatch(matchNotifier, match),
     readPages: (onPage) =>
       fetchEventPages({
-        rpcUrl: STELLAR_RPC_URL,
-        contractId: ANNOUNCER_CONTRACT,
+        rpcUrl: getStellarNetworkConfig().rpcUrl,
+        contractId: getStellarContractId('announcer'),
         // undefined lets the module clamp a first scan to the retention window.
         startLedger,
         onPage: (page) =>
@@ -229,9 +229,6 @@ async function scanStoredKey(
           }),
       }),
     commit: (nextLedger) => updateLastScannedLedger(db, storedKey.publicKey, nextLedger),
-  });
-}
-
 async function scrubLegacyKeys(): Promise<void> {
   try {
     const db = await openDB();
