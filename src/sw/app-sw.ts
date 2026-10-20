@@ -211,8 +211,7 @@ async function scanStoredKey(
   storedKey: StoredViewingKey,
   startLedger: number | undefined,
 ): Promise<void> {
-
-    await scanPages({
+  await scanPages({
     backend: createIdbScanKeyBackend(),
     publicKey: storedKey.publicKey,
     notifyMatch: (match) => deliverMatch(matchNotifier, match),
@@ -229,6 +228,9 @@ async function scanStoredKey(
           }),
       }),
     commit: (nextLedger) => updateLastScannedLedger(db, storedKey.publicKey, nextLedger),
+  });
+}
+
 async function scrubLegacyKeys(): Promise<void> {
   try {
     const db = await openDB();
